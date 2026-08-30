@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#000000" />
+  <link rel="manifest" href="%PUBLIC_URL%/manifest.json" />
+  <script src="%PUBLIC_URL%/js/browserfs.min.js"></script>
+  <link href="https://fonts.gstatic.com" rel="preconnect" crossorigin>
+</head>
+
+<body>
+  <script>
+    // The flycast core's glGetString override calls ctx.getParameter(GL_EXTENSIONS)
+    // (enum 0x1F03 = 7939), which is INVALID in WebGL and leaves a pending
+    // GL_INVALID_ENUM that makes RetroArch's video driver init fail.
+    // Patch getParameter so GL_EXTENSIONS returns the supported extensions string.
+    const origGetContext = HTMLCanvasElement.prototype.getContext;
+    HTMLCanvasElement.prototype.getContext = function(...args) {
+        const ctx = origGetContext.apply(this, args);
+        if (ctx && (typeof WebGLRenderingContext === "function" && (ctx instanceof WebGLRenderingContext || ctx instanceof WebGL2RenderingContext))) {
+            const origGetParameter = ctx.getParameter.bind(ctx);
+            ctx.getParameter = function(pname) {
+                if (pname === 0x1F03) { // GL_EXTENSIONS
+                    const exts = ctx.getSupportedExtensions();
+                    if (Array.isArray(exts)) return exts.join(" ");
+                    return "";
+                }
+                return origGetParameter(pname);
+            };
+            if (typeof ctx.getSupportedExtensions !== "function") {
+                ctx.getSupportedExtensions = function() { return []; };
+            }
+        }
+        return ctx;
+    };
+  </script>
+  <noscript>You need to enable JavaScript to run this app.</noscript>
+  <div id="root"></div>
+</body>
+
+</html>
