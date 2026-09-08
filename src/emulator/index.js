@@ -7,6 +7,8 @@ import {
   KeyCodeToControlMapping,
   KCODES,
   CIDS,
+  Zip,
+  storage,
 } from '@webrcade/app-common';
 
 // WRC - libretro's own standard RETRO_DEVICE_ID_JOYPAD_* bit positions
@@ -35,15 +37,33 @@ const JOYPAD_X = 1 << 9;
 const JOYPAD_L2 = 1 << 12;
 const JOYPAD_R2 = 1 << 13;
 
+// WRC - same ANALOG_BIT convention as the N64 apps (see e.g.
+// webrcade-app-retro-mupen64plus-next's index.js): OR'd onto CIDS.UP/DOWN/
+// LEFT/RIGHT, it tells the shared Controllers/KeyCodeToControlMapping
+// framework (webrcade-app-common) to route that key into the analog stick
+// axes (controllers.getAxisValue()) instead of a digital isControlDown()
+// direction. pollControls() below already calls getAxisValue() and forwards
+// it into sendInput() unconditionally - previously always 0 from keyboard
+// since nothing fed it; a real gamepad's stick already worked.
+const ANALOG_BIT = 0x8000;
+const ANALOG_UP = ANALOG_BIT | CIDS.UP;
+const ANALOG_DOWN = ANALOG_BIT | CIDS.DOWN;
+const ANALOG_LEFT = ANALOG_BIT | CIDS.LEFT;
+const ANALOG_RIGHT = ANALOG_BIT | CIDS.RIGHT;
+
 class DreamcastKeyCodeToControlMapping extends KeyCodeToControlMapping {
   constructor() {
     super({
       [KCODES.ENTER]: CIDS.START,
       [KCODES.ESCAPE]: CIDS.ESCAPE,
-      [KCODES.ARROW_UP]: CIDS.UP,
-      [KCODES.ARROW_DOWN]: CIDS.DOWN,
-      [KCODES.ARROW_LEFT]: CIDS.LEFT,
-      [KCODES.ARROW_RIGHT]: CIDS.RIGHT,
+      [KCODES.ARROW_UP]: ANALOG_UP,
+      [KCODES.ARROW_DOWN]: ANALOG_DOWN,
+      [KCODES.ARROW_LEFT]: ANALOG_LEFT,
+      [KCODES.ARROW_RIGHT]: ANALOG_RIGHT,
+      [KCODES.I]: CIDS.UP,
+      [KCODES.J]: CIDS.LEFT,
+      [KCODES.K]: CIDS.DOWN,
+      [KCODES.L]: CIDS.RIGHT,
       [KCODES.Z]: CIDS.A,
       [KCODES.X]: CIDS.B,
       [KCODES.A]: CIDS.X,
@@ -138,8 +158,21 @@ class DreamcastKeyCodeToControlMapping extends KeyCodeToControlMapping {
 
 export class Emulator extends RetroAppWrapper {
 
-  GAME_SRAM_NAME = 'vmu_save.bin';
+  // WRC - required by RetroAppWrapper itself (retrowrapper/index.js:914,
+  // `this.saveStatePath = ${this.saveStatePrefix}${this.SAVE_NAME}`) to
+  // compute saveStatePath at boot - see the same note in
+  // webrcade-app-retro-ppsspp's index.js for the full explanation.
   SAVE_NAME = 'sav';
+
+  // WRC - real save data (VMU saves) lives here, confirmed via actual
+  // FS.readdir() on a running instance: '.', '..', 'dc_boot.bin',
+  // 'dc_flash.bin', 'data', 'vmu_save_A1.bin', 'vmu_save_B1.bin',
+  // 'vmu_save_C1.bin', 'vmu_save_D1.bin'. dc_boot.bin/dc_flash.bin are the
+  // Dreamcast BIOS/flash images, not save data - excluded below. Whatever
+  // is generated dynamically (VMU files, plus anything under data/) gets
+  // walked and saved.
+  SAVE_DIR = '/home/web_user/retroarch/userdata/system/dc';
+  SAVE_EXCLUDE = ['dc_boot.bin', 'dc_flash.bin'];
 
   constructor(app, debug = false) {
     super(app, debug);
@@ -285,6 +318,30 @@ export class Emulator extends RetroAppWrapper {
     return false;
   }
 
+  // WRC POC (cache-dump sizing, 2026-09-01): on an actual pause transition,
+  // log the current compiled-cache size via the paired POC export in
+  // core/rec-wasm/rec_wasm.cpp (WRC_CACHE_DUMP_POC / wasm_cache_dump_bytes).
+  // Measure-only - nothing is persisted here, this is purely to see how big
+  // a real per-title warm-start cache would need to be before building one.
+  // super.pause()'s return value (only true on a REAL state transition, not
+  // a no-op repeat call) is preserved exactly - see AppWrapper.pause() in
+  // webrcade-app-common/src/app/wrapper.js.
+  pause(p, isMenu) {
+    const result = super.pause(p, isMenu);
+    if (result && p) {
+      try {
+        const { Module } = window;
+        if (Module && typeof Module._wasm_cache_dump_bytes === 'function') {
+          const totalBytes = Module._wasm_cache_dump_bytes();
+          LOG.info(`[cache-dump POC] total compiled cache: ${(totalBytes / 1048576).toFixed(2)}MB (see console for the blocks/chains breakdown logged by the native call)`);
+        }
+      } catch (e) {
+        LOG.error('[cache-dump POC] Error reading cache size: ' + e);
+      }
+    }
+    return result;
+  }
+
   applyGameSettings() {}
 
   isForceAspectRatio() {
@@ -322,78 +379,336 @@ export class Emulator extends RetroAppWrapper {
 
   getShotAspectRatio() { return this.getDefaultAspectRatio(); }
 
-  // WRC - unverified: flycast's own VMU/save file naming/path hasn't been
-  // confirmed against an actual save produced by the core (needs a real
-  // BIOS + game to test against). Modeled on the N64 apps' saveState()
-  // shape (RetroArch's _cmd_savefiles() flush, then read back whatever
-  // ends up in the saves directory) as a reasonable starting point, not a
-  // confirmed-correct implementation.
-  async saveState() {
-    const { saveStatePath, started } = this;
-    const { FS, Module } = window;
+  // WRC - real Dreamcast save data (VMU saves, plus anything under data/)
+  // lives in a directory tree, not a single fixed file - same shape as
+  // webrcade-app-retro-ppsspp's SAVEDATA handling (see that app's index.js
+  // for the original precedent, itself modeled on
+  // webrcade-app-retro-dosbox-pure's saveState()). Walks SAVE_DIR
+  // recursively (FS.readdir + FS.stat mode-bit checks), skipping anything
+  // named in SAVE_EXCLUDE (the BIOS/flash images, not save data), and hands
+  // the whole tree to SaveManager as one flat {name, content} array -
+  // checkFilesChanged() hashes each file individually to skip saving when
+  // nothing changed, and zips the tree using each entry's name (which
+  // includes the relative subdirectory path) as its path inside the zip.
+  // WRC POC (2026-09-01): flush the JIT's pending-compile buffer (see
+  // core/rec-wasm/rec_wasm.cpp's WRC_CACHE_DUMP_POC) into the shared
+  // IndexedDB-backed `storage` helper (webrcade-app-common/src/storage) -
+  // the same one used all over the app for prefs, etc. Merges onto
+  // whatever's already stored under this title's key so earlier sessions'
+  // progress isn't discarded, then clears the C++-side pending buffer only
+  // once the write actually succeeds - a failed/offline write leaves the
+  // pending chunks in place to retry on the next save.
+  //
+  // Deliberately simple, per direct instruction: no per-address dedup
+  // against previously-stored chunks (a re-saved chunk with the same key
+  // just overwrites, which is correct - it's the latest compile of that
+  // address), no size-threshold trigger, whole pending buffer flushed on
+  // every saveState() call. Loading this back and re-priming the live
+  // dispatch table with it (skipping recompilation) is NOT implemented -
+  // this only writes it to storage.
+  async flushJitCacheToStorage() {
+    const { Module } = window;
+    if (!Module || !Module._flyPendingChunks) return;
+
+    const pending = Module._flyPendingChunks;
+    const keys = Object.keys(pending);
+    if (keys.length === 0) return;
+
+    const pendingBytes = keys.reduce((sum, k) => sum + pending[k].bytes.byteLength, 0);
+    LOG.info(`[WRC persist] flushing ${keys.length} pending JIT chunks (${(pendingBytes / 1024).toFixed(1)}KB) to storage`);
 
     try {
-      if (!started) {
-        return;
-      }
+      // WRC - matches the same /wrc/<appType>/<uid>/... hierarchy saves and
+      // prefs already use (see getAppStoragePath() in
+      // webrcade-app-common/src/apps/applist.js and saveStatePrefix above),
+      // not an ad-hoc key - keeps this entry grouped under the game the
+      // same way everything else in IndexedDB already is.
+      const storageKey = this.getApp().getStoragePath(`${this.uid}/jitcache`);
+      const existing = await storage.get(storageKey);
+      const merged = (existing && typeof existing === 'object') ? { ...existing } : {};
+      let newCount = 0;
+      keys.forEach(k => {
+        if (!merged[k]) newCount++;
+        merged[k] = pending[k];
+      });
 
-      Module._cmd_savefiles();
+      await storage.put(storageKey, merged);
 
-      const files = [];
-      const path = `/home/web_user/retroarch/userdata/saves/${this.GAME_SRAM_NAME}`;
-      LOG.info('Checking: ' + path);
-      try {
-        const s = FS.readFile(path);
-        if (s) {
-          files.push({ name: this.SAVE_NAME, content: s });
+      // Only clear on confirmed success - an offline/failed write keeps
+      // the pending chunks around to retry on the next save.
+      Module._flyPendingChunks = {};
+
+      const totalKeys = Object.keys(merged).length;
+      const totalBytes = Object.values(merged).reduce((sum, v) => sum + v.bytes.byteLength, 0);
+      LOG.info(`[WRC persist] saved. total persisted: ${totalKeys} chunks (${(totalBytes / 1048576).toFixed(2)}MB), ${newCount} new this flush`);
+    } catch (e) {
+      LOG.error('[WRC persist] Error flushing JIT cache to storage: ' + e);
+    }
+  }
+
+  async saveState() {
+    const { saveStatePath, started, SAVE_DIR, SAVE_EXCLUDE } = this;
+    const { FS, Module } = window;
+
+    if (!started) {
+      return;
+    }
+
+    await this.flushJitCacheToStorage();
+
+    Module._cmd_savefiles();
+
+    try {
+      const saveFiles = [];
+
+      const walkFiles = (path) => {
+        let dir;
+        try {
+          dir = FS.readdir(path);
+        } catch (e) {
+          return;
         }
-      } catch (e) {}
+        dir.forEach(entry => {
+          if (entry === '.' || entry === '..') return;
+          if (path === SAVE_DIR && SAVE_EXCLUDE.includes(entry)) return;
+          const fullPath = path + '/' + entry;
+          const stat = FS.stat(fullPath);
+          const isDirectory = (stat.mode & 0o40000) !== 0;
+          const isFile = (stat.mode & 0o100000) !== 0;
+          if (isDirectory) {
+            walkFiles(fullPath);
+          } else if (isFile) {
+            const s = FS.readFile(fullPath);
+            if (s) {
+              saveFiles.push({
+                name: fullPath.substring(SAVE_DIR.length + 1),
+                content: s,
+              });
+            }
+          }
+        });
+      };
+      walkFiles(SAVE_DIR);
 
-      if (files.length > 0) {
-        if (await this.getSaveManager().checkFilesChanged(files)) {
+      if (saveFiles.length > 0) {
+        if (await this.getSaveManager().checkFilesChanged(saveFiles)) {
+          const totalBytes = saveFiles.reduce((sum, f) => sum + f.content.length, 0);
+          const toKB = (bytes) => (bytes / 1024).toFixed(1) + 'KB';
+
+          // WRC - SaveManager.save() zips internally but doesn't return the
+          // zip or its size, so measuring the actual compressed size means
+          // zipping locally too (same Zip helper SaveManager itself uses)
+          // just for this log - a real, if small, redundant compression
+          // pass on every save. Was useful for checking real-world save
+          // sizes during development; commented out rather than removed
+          // since it's cheap to re-enable if that's needed again (see the
+          // same pattern/note in webrcade-app-retro-ppsspp's index.js).
+          // let compressedBytes = null;
+          // try {
+          //   const zip = new Zip();
+          //   const zipBlob = await zip.zipFiles(
+          //     saveFiles.map(f => ({
+          //       name: f.name,
+          //       content: f.content instanceof Blob ? f.content : new Blob([f.content]),
+          //     }))
+          //   );
+          //   compressedBytes = zipBlob.size;
+          // } catch (e) {
+          //   LOG.error('Error measuring Dreamcast save data zip size: ' + e);
+          // }
+
+          LOG.info(
+            `Saving Dreamcast save data: ${saveFiles.length} file(s), ` +
+            `${toKB(totalBytes)} uncompressed`
+            // + (compressedBytes !== null ? `, ${toKB(compressedBytes)} compressed (zip)` : '')
+          );
+          saveFiles.forEach(f => LOG.info(`  ${f.name}: ${toKB(f.content.length)}`));
+
           await this.getSaveManager().save(
             saveStatePath,
-            files,
+            saveFiles,
             this.saveMessageCallback,
           );
         }
-      } else {
-        await this.getSaveManager().delete(path);
       }
     } catch (e) {
       LOG.error('Error persisting save state: ' + e);
     }
   }
 
+  // WRC POC (2026-09-01, load side): re-primes previously-compiled blocks
+  // persisted by flushJitCacheToStorage() above, so they skip recompilation
+  // entirely on this session instead of just sitting unread in storage.
+  // Only block chunks ('b'-prefixed keys) are attempted - chain/region/
+  // batch chunks are saved but not re-primed yet (see WRC_CACHE_LOAD_POC's
+  // definition in rec_wasm.cpp for why). For each block: verify its stored
+  // hash against the address's CURRENT live RAM content
+  // (wasm_verify_block_hash) BEFORE touching anything else - only on a
+  // pass does it get instantiated (wasm_load_block, via a malloc'd scratch
+  // buffer since the bytes need to be copied into WASM linear memory
+  // first) and wired into the live dispatch table
+  // (wasm_try_prime_block, which re-verifies as a second, cheap check). A
+  // failed verify at either point just skips that one block silently - it
+  // recompiles fresh on its first real dispatch, exactly as if it had
+  // never been persisted. Called from loadState() to match where save
+  // data itself gets restored - timing not yet confirmed correct by real
+  // testing; if the game's boot sequence hasn't finished placing its
+  // initial code into RAM by this point, live hashes may not be
+  // meaningful yet and legitimate blocks could get skipped as "stale."
+  async primeJitCacheFromStorage() {
+    const { Module } = window;
+    if (!Module || typeof Module._wasm_verify_block_hash !== 'function') return;
+
+    try {
+      const storageKey = this.getApp().getStoragePath(`${this.uid}/jitcache`);
+      const stored = await storage.get(storageKey);
+      if (!stored || typeof stored !== 'object') return;
+
+      // WRC - must be 'b' immediately followed by an optional '-' and
+      // digits (the block pc), NOT just "starts with b" - 'batch' + N keys
+      // (multi-function batch modules, see rec_wasm.cpp's
+      // wasm_compile_block_batch) also start with 'b' and were matching
+      // here too. Those export their functions as b0/b1/b2... not a single
+      // "b", so wasm_load_block (built for single-block modules) found
+      // instance.exports.b undefined and WebAssembly.Table.set() threw -
+      // repeatedly, since parseInt() on the mangled "atch5"-style
+      // substring returns NaN, which coerces to pc=0 when passed into the
+      // WASM call. Confirmed as the cause of a real crash (2026-09-01): 820
+      // straight instantiate failures, all logged as pc=0x0.
+      //
+      // The leading '-?' matters just as much as the digit-only fix above:
+      // block_pc crosses the C++->JS boundary as a signed 32-bit number
+      // (Emscripten's default for a u32 param), and every Dreamcast RAM
+      // address (0x8c000000+) has its high bit set, so essentially every
+      // real block key looks like 'b-1945883454', not 'b1945883454' -
+      // confirmed directly in the actual stored data (devtools showed
+      // exactly this). A digits-only regex silently rejected nearly every
+      // real block, which is why the very next thing after fixing the
+      // batch-key bug was "0 primed, 100% stale" instead of real numbers.
+      const blockKeys = Object.keys(stored).filter(k => /^b-?\d+$/.test(k));
+      if (blockKeys.length === 0) return;
+
+      LOG.info(`[WRC persist] attempting to re-prime ${blockKeys.length} persisted blocks from storage`);
+
+      let primed = 0;
+      let stale = 0;
+      let failed = 0;
+
+      blockKeys.forEach(k => {
+        const entry = stored[k];
+        if (!entry || !entry.bytes) {
+          failed++;
+          return;
+        }
+        const pc = parseInt(k.substring(1), 10);
+        const { bytes, hash, nw } = entry;
+
+        if (!Module._wasm_verify_block_hash(pc, hash, nw)) {
+          stale++;
+          return;
+        }
+
+        const ptr = Module._malloc(bytes.length);
+        try {
+          Module.HEAPU8.set(bytes, ptr);
+          const tableIdx = Module._wasm_load_block(ptr, bytes.length, pc);
+          if (tableIdx <= 0) {
+            failed++;
+            return;
+          }
+          if (Module._wasm_try_prime_block(pc, tableIdx, hash, nw)) {
+            primed++;
+            // WRC POC: the definitive "is this actually being used" signal.
+            // rec_wasm.cpp's compile sites check this set and fire a loud
+            // REGRESSION warning if a PC in here ever needs a real
+            // recompile - which should never happen unless the game
+            // genuinely rewrote that code (SMC), since priming means the
+            // dispatch table already has a live, verified-fresh entry for
+            // it. If that warning never fires despite the game revisiting
+            // this content, priming held. If it fires, priming isn't
+            // actually preventing recompiles.
+            if (!Module._flyPrimedPcs) Module._flyPrimedPcs = new Set();
+            Module._flyPrimedPcs.add(pc);
+          } else {
+            stale++;
+          }
+        } finally {
+          Module._free(ptr);
+        }
+      });
+
+      LOG.info(`[WRC persist] re-primed ${primed}/${blockKeys.length} blocks from storage (${stale} stale/skipped, ${failed} failed) - watch for "[WRC persist] REGRESSION" warnings during play to confirm they're actually staying in use`);
+    } catch (e) {
+      LOG.error('[WRC persist] Error priming JIT cache from storage: ' + e);
+    }
+  }
+
   async loadState() {
-    const { saveStatePath } = this;
+    const { saveStatePath, SAVE_DIR } = this;
     const { FS } = window;
 
     try {
-      const files = await this.getSaveManager().load(
+      const saveFiles = await this.getSaveManager().load(
         saveStatePath,
         this.loadMessageCallback,
       );
 
-      if (files) {
-        for (let i = 0; i < files.length; i++) {
-          const f = files[i];
-          if (f.name === this.SAVE_NAME) {
-            FS.writeFile(
-              `/home/web_user/retroarch/userdata/saves/${this.GAME_SRAM_NAME}`,
-              f.content,
-            );
-          }
+      if (saveFiles) {
+        for (let i = 0; i < saveFiles.length; i++) {
+          const f = saveFiles[i];
+          const outPath = `${SAVE_DIR}/${f.name}`;
+          const destDir = outPath.substring(0, outPath.lastIndexOf('/'));
+          this.createDirectories(FS, destDir);
+          FS.writeFile(outPath, f.content);
         }
-        await this.getSaveManager().checkFilesChanged(files);
+
+        LOG.info(`Restored Dreamcast save data: ${saveFiles.length} file(s)`);
+
+        await this.getSaveManager().checkFilesChanged(saveFiles);
       }
     } catch (e) {
       LOG.error('Error loading save state: ' + e);
     }
   }
 
+  // WRC POC (load side, moved 2026-09-01): primeJitCacheFromStorage() was
+  // originally called from loadState(), which runs entirely BEFORE the
+  // mainloop starts - meaning the SH4 hadn't executed a single instruction
+  // yet, so RAM was still cold-boot/BIOS-only state with nothing
+  // matching what was hashed last session (confirmed: 0/9440 primed, ~92%
+  // "stale"). RetroAppWrapper's own main loop
+  // (webrcade-app-common/src/app/retrowrapper/index.js) already calls
+  // Module._emscripten_mainloop() (the real SH4 step) BEFORE calling
+  // onFrame() each tick, so by the time onFrame() fires even once, real
+  // execution has already happened - mirrors the same delayed-start
+  // pattern already used elsewhere in this codebase (a frame-count gate,
+  // not a wall-clock wait) rather than inventing a new one.
+  jitCachePrimeFrameCount = 0;
+
+  // WRC POC - DISABLED (2026-09-01): commented out alongside the core-side
+  // WRC_CACHE_DUMP_POC/WRC_CACHE_LOAD_POC flags (see rec_wasm.cpp). The
+  // core's wasm_verify_block_hash is now an unconditional `return 0` stub,
+  // so this call could never succeed - but the client doesn't know that in
+  // advance, and was still paying for a real storage.get() read of the
+  // whole persisted blob plus a loop over every entry, every session, for
+  // a guaranteed-zero result. No point paying that until the exception-
+  // delivery gap that caused the crash is actually fixed and the core side
+  // is re-enabled.
+  onFrame() {
+    /*
+    if (this.jitCachePrimeFrameCount === -1) return;
+
+    if (this.jitCachePrimeFrameCount > 30) {
+      this.jitCachePrimeFrameCount = -1;
+      this.primeJitCacheFromStorage();
+    } else {
+      this.jitCachePrimeFrameCount++;
+    }
+    */
+  }
+
   pollControls() {
-    const { controllers } = this;
+    const { controllers, keyToControlMapping } = this;
 
     controllers.poll();
 
@@ -437,8 +752,23 @@ export class Emulator extends RetroAppWrapper {
       // if (controllers.isControlDown(i, CIDS.RTRIG)) input |= JOYPAD_R2;
       if (controllers.isControlDown(i, CIDS.SELECT)) input |= JOYPAD_SELECT;
 
-      const axisX = controllers.getAxisValue(i, 0, true);
-      const axisY = controllers.getAxisValue(i, 0, false);
+      let axisX = controllers.getAxisValue(i, 0, true);
+      let axisY = controllers.getAxisValue(i, 0, false);
+
+      // WRC - getAxisValue() only ever reads a real gamepad's pad.axes (see
+      // webrcade-app-common/src/input/controls.js) - it has no idea
+      // ANALOG_BIT-tagged keyboard keys exist. Same pattern as the N64
+      // apps' pollControls(): the ANALOG_BIT tag just gives those keys a
+      // distinct value in the mapping table, and it's this app's own job
+      // to check for it directly (via keyToControlMapping.isControlDown(),
+      // not controllers.isControlDown()) and override the axis value by
+      // hand. Player 1 (keyboard) only, matching the N64 apps.
+      if (i === 0) {
+        if (keyToControlMapping.isControlDown(ANALOG_RIGHT)) axisX = 1;
+        if (keyToControlMapping.isControlDown(ANALOG_LEFT)) axisX = -1;
+        if (keyToControlMapping.isControlDown(ANALOG_UP)) axisY = -1;
+        if (keyToControlMapping.isControlDown(ANALOG_DOWN)) axisY = 1;
+      }
 
       this.sendInput(i, input, axisX, axisY, 0, 0);
     }

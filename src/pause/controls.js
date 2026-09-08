@@ -25,10 +25,14 @@ export class KeyboardControlsTab extends ControlsTab {
     return (
       <>
         {this.renderKey('Enter', 'Start')}
-        {this.renderKey('ArrowUp', 'D-pad (Up)')}
-        {this.renderKey('ArrowDown', 'D-pad (Down)')}
-        {this.renderKey('ArrowLeft', 'D-pad (Left)')}
-        {this.renderKey('ArrowRight', 'D-pad (Right)')}
+        {this.renderKey('ArrowUp', 'Analog stick (Up)')}
+        {this.renderKey('ArrowDown', 'Analog stick (Down)')}
+        {this.renderKey('ArrowLeft', 'Analog stick (Left)')}
+        {this.renderKey('ArrowRight', 'Analog stick (Right)')}
+        {this.renderKey('KeyI', 'D-pad (Up)')}
+        {this.renderKey('KeyK', 'D-pad (Down)')}
+        {this.renderKey('KeyJ', 'D-pad (Left)')}
+        {this.renderKey('KeyL', 'D-pad (Right)')}
         {this.renderKey('KeyZ', 'A')}
         {this.renderKey('KeyX', 'B')}
         {this.renderKey('KeyA', 'X')}
