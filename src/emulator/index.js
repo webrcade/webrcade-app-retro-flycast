@@ -7,9 +7,12 @@ import {
   KeyCodeToControlMapping,
   KCODES,
   CIDS,
-  Zip,
+  // Zip,
   storage,
+  ScriptAudioProcessor,
 } from '@webrcade/app-common';
+
+import { FlycastPrefs, FRAME_SKIP } from './prefs';
 
 // WRC - libretro's own standard RETRO_DEVICE_ID_JOYPAD_* bit positions
 // (1<<id), used as the "input" bitmask passed to wrc_set_input(). Chosen
@@ -120,41 +123,79 @@ class DreamcastKeyCodeToControlMapping extends KeyCodeToControlMapping {
 // delta, before/after size, and a JS stack trace at the call site) to find
 // what's actually driving heap growth on iOS/Xbox, where the tab silently
 // crashes with no other actionable diagnostics. Commented out 2026-08-29
-// (memory investigation paused, not resolved) - uncomment to resume.
-/*
-(function patchWasmMemoryGrow() {
-  if (window.__wrcWasmGrowPatched) return;
-  window.__wrcWasmGrowPatched = true;
-  const origGrow = WebAssembly.Memory.prototype.grow;
-  WebAssembly.Memory.prototype.grow = function (delta) {
-    const before = this.buffer.byteLength;
-    try {
-      const result = origGrow.call(this, delta);
-      const after = this.buffer.byteLength;
-      console.log(
-        `[WRC-DEBUG] WASM memory grow: delta=${delta} pages (${(
-          (delta * 65536) /
-          1048576
-        ).toFixed(1)}MB) before=${(before / 1048576).toFixed(
-          1,
-        )}MB after=${(after / 1048576).toFixed(1)}MB`,
-      );
-      console.trace('[WRC-DEBUG] grow() call site');
-      return result;
-    } catch (e) {
-      console.log(
-        `[WRC-DEBUG] WASM memory grow FAILED: delta=${delta} pages (${(
-          (delta * 65536) /
-          1048576
-        ).toFixed(1)}MB) before=${(before / 1048576).toFixed(1)}MB - ${e && e.message}`,
-      );
-      console.trace('[WRC-DEBUG] grow() FAILED call site');
-      throw e;
-    }
-  };
-  LOG.info('[WRC-DEBUG] WebAssembly.Memory.prototype.grow patched for growth tracing');
-})();
-*/
+// (memory investigation paused). Re-enabled 2026-09-09 to chase the Sonic
+// Adventure 2 playtime-dependent OOM - findings recorded in memory
+// (project_flycast_sonic_adventure2_oom) - re-disabled once that
+// investigation concluded (three growth sources identified, no fix
+// implemented yet). Re-enable + see that memory file if resuming this.
+// (function patchWasmMemoryGrow() {
+//   if (window.__wrcWasmGrowPatched) return;
+//   window.__wrcWasmGrowPatched = true;
+//
+//   // WRC (2026-09-09): aggregate by call-site signature instead of dumping
+//   // a full trace per event - a long play session can trigger dozens of
+//   // these, and scrolling through near-duplicate traces isn't practical.
+//   // Each event costs one cheap Error().stack capture (no throw) and a Map
+//   // lookup; call window.__wrcDumpGrowthSummary() from the console at any
+//   // point to print a table of distinct call sites sorted by total MB
+//   // grown, with a sample stack for the top offenders.
+//   const growthBySite = new Map(); // signature -> { count, totalBytes, sampleStack }
+//   window.__wrcDumpGrowthSummary = function () {
+//     const rows = Array.from(growthBySite.entries())
+//       .map(([sig, v]) => ({ sig, ...v }))
+//       .sort((a, b) => b.totalBytes - a.totalBytes);
+//     console.log(`[WRC-DEBUG] ${rows.length} distinct growth call site(s):`);
+//     rows.forEach((r, i) => {
+//       console.log(
+//         `  #${i + 1}: ${r.count}x, ${(r.totalBytes / 1048576).toFixed(1)}MB total`,
+//       );
+//       console.log(r.sampleStack);
+//     });
+//     return rows;
+//   };
+//
+//   const origGrow = WebAssembly.Memory.prototype.grow;
+//   WebAssembly.Memory.prototype.grow = function (delta) {
+//     const before = this.buffer.byteLength;
+//     try {
+//       const result = origGrow.call(this, delta);
+//       const after = this.buffer.byteLength;
+//       const deltaBytes = after - before;
+//       const stack = new Error('[WRC-DEBUG] grow() call site').stack || '';
+//       // Skip the Error's own message line + this wrapper's frame; the next
+//       // handful of frames are stable enough to bucket by call site without
+//       // needing the full trace on every single event.
+//       const sig = stack.split('\n').slice(2, 8).map((l) => l.trim()).join(' <- ');
+//       let entry = growthBySite.get(sig);
+//       if (!entry) {
+//         entry = { count: 0, totalBytes: 0, sampleStack: stack };
+//         growthBySite.set(sig, entry);
+//       }
+//       entry.count++;
+//       entry.totalBytes += deltaBytes;
+//       console.log(
+//         `[WRC-DEBUG] grow: +${(deltaBytes / 1048576).toFixed(1)}MB (total ${(
+//           after / 1048576
+//         ).toFixed(1)}MB) - site seen ${entry.count}x so far, ${
+//           growthBySite.size
+//         } distinct site(s) - call __wrcDumpGrowthSummary() for details`,
+//       );
+//       return result;
+//     } catch (e) {
+//       console.log(
+//         `[WRC-DEBUG] WASM memory grow FAILED: delta=${delta} pages (${(
+//           (delta * 65536) /
+//           1048576
+//         ).toFixed(1)}MB) before=${(before / 1048576).toFixed(1)}MB - ${e && e.message}`,
+//       );
+//       console.trace('[WRC-DEBUG] grow() FAILED call site');
+//       throw e;
+//     }
+//   };
+//   LOG.info(
+//     '[WRC-DEBUG] WebAssembly.Memory.prototype.grow patched (aggregated by call site - use window.__wrcDumpGrowthSummary() in the console when ready)',
+//   );
+// })();
 
 export class Emulator extends RetroAppWrapper {
 
@@ -178,10 +219,254 @@ export class Emulator extends RetroAppWrapper {
     super(app, debug);
     window.emulator = this;
     this.analogMode = true;
+    this.prefs = new FlycastPrefs(this);
+
+    // WRC (2026-09-09): DisplayLoop pacing target, driven by setPalMode()
+    // below (same SPG_CONTROL.isPAL() signal already used for the frame-
+    // skip threshold) - mirrors retro-snes9x/retro-genplusgx's
+    // frequency/lastFrequency + getDisplayLoopReturn() pattern. Without
+    // this the loop always paces itself at 60fps, so a real 50Hz PAL game
+    // runs fast/high-pitched (loop keeps calling retro_run() ~20% too
+    // often relative to the content's actual timing).
+    this.frequency = 60;
+    this.lastFrequency = 60;
+
+    // WRC (2026-09-08): same pattern as webrcade-app-retro-ppsspp - bypass
+    // the emulator core's own JS-side audio sink (flycast's C++ audiostream.cpp
+    // called this straight into an AudioWorklet ring buffer, EM_ASM'd from
+    // retro_audio_upload() there) and instead call directly into
+    // @webrcade/app-common's ScriptAudioProcessor circular queue, matching
+    // every other WRC libretro core. Real iOS testing (Crazy Taxi, heavy 3D
+    // scenes) showed audible dropped audio chunks with the AudioWorklet sink
+    // that this shared, well-tested path doesn't show elsewhere - see the
+    // matching C++-side change in retrostash/flycast-wasm's
+    // source-canonical/shell/libretro/audiostream.cpp for the reference this
+    // mirrors (ppsspp-wasm/libretro/libretro.cpp's
+    // upload_output_audio_buffer()).
+    this.audioStarted = 0;
+
+    // WRC (2026-09-11): flat-percentage stretch per call, not a fixed
+    // target frame count. Two earlier attempts both assumed a STABLE
+    // target frame count (derived from sampleRate/frequency, snes9x-
+    // style) was the right thing to hit each call - but flycast's real
+    // per-call length alternates between two very different sizes
+    // (observed: ~1107 then ~365, repeating), so anything chasing a
+    // fixed target either flip-flopped between upsampling/downsampling
+    // (audible warble) or needed a reservoir+leaky-integrator to smooth
+    // that out, which produced periodic pops in practice instead of
+    // fixing them. Simpler and it directly follows from what's actually
+    // going wrong: whatever length arrives THIS call, stretch it by a
+    // flat percentage (frame-walking resample, same technique as
+    // retro-snes9x's) to intentionally hand the downstream
+    // ScriptAudioProcessor circular queue slightly MORE than it strictly
+    // needs, every single call, regardless of whether this particular
+    // call was a "big" or "small" one - builds and maintains a real
+    // surplus cushion in the queue against momentary supply gaps
+    // (that cushion is what actually stops the periodic pops), with no
+    // dependency on a fixed target rate at all.
+    // Starting point: same ratio as the established +15/44100 pad
+    // (~0.034%), not the earlier unjustified 3%. At ~365-1107 frames per
+    // call that's only 0.12-0.38 of a frame per call - too small for
+    // Math.round to ever act on by itself, so audioStretchCarry banks
+    // the fractional remainder across calls (same idea as SNES's
+    // fractional carry) instead of it silently rounding away to nothing
+    // every time. Increase AUDIO_STRETCH_PCT if pops persist.
+    const AUDIO_STRETCH_PCT = 15 / 44100;
+    this.audioStretchCarry = 0;
+    this.audioCallback = (offset, length) => {
+      const input = new Int16Array(
+        window.Module.HEAP16.buffer,
+        offset,
+        length << 1
+      );
+
+      const rawOutFrames =
+        length * (1 + AUDIO_STRETCH_PCT) + this.audioStretchCarry;
+      const outFrames = Math.max(1, Math.floor(rawOutFrames));
+      this.audioStretchCarry = rawOutFrames - outFrames;
+      const outSamples = outFrames << 1;
+      const output = new Int16Array(outSamples);
+
+      // ---- frame walking resampler (no timing drift) ----
+      const step = length / outFrames;
+      let srcFrame = 0;
+      for (let i = 0; i < outFrames; i++) {
+        const si = (srcFrame | 0) << 1;
+        output[i * 2] = input[si];
+        output[i * 2 + 1] = input[si + 1];
+        srcFrame += step;
+      }
+
+      this.audioProcessor.storeSoundCombinedInput(
+        output,
+        2,
+        outSamples,
+        0,
+        32768
+      );
+    };
   }
 
   getHashFileExtension() {
     return 'chd';
+  }
+
+  // WRC (2026-09-08): two distinct values here, on purpose -
+  // getPrefs().getFrameSkip() is the PERSISTED preference (auto/disabled/
+  // 1/2, whatever's shown/edited in the pause-menu Select), while
+  // currentFrameSkip is the actual live level in effect right now (always
+  // a plain number, never "auto" - when the preference IS "auto" this is
+  // whatever the FPS-driven heuristic below last decided). resolveFrameSkip()
+  // is the one place that reconciles the two and is safe to call any time
+  // something needs the real current value (boot, live-apply, the debug
+  // overlay).
+  //
+  // WRC (2026-09-09): auto starts at 1, not 0 - deliberately conservative.
+  // The two failure modes aren't symmetric: starting at 0 on a weak device
+  // means a real audible glitch during its first heavy moment before the
+  // heuristic reacts; starting at 1 on a strong device just means a
+  // probably-imperceptible frame-skip during whatever's on screen for the
+  // first ~20s (often a menu/light intro) before it relaxes to 0. A glitch
+  // is a worse first impression than invisible frame-skipping, so bias
+  // toward the safe state.
+  currentFrameSkip = 1;
+
+  resolveFrameSkip() {
+    const persisted = this.getPrefs().getFrameSkip();
+    const value = persisted === FRAME_SKIP.FS_AUTO
+      ? this.currentFrameSkip
+      : (persisted === FRAME_SKIP.FS_OFF ? 0 : parseInt(persisted, 10));
+    this.currentFrameSkip = value;
+    return value;
+  }
+
+  frameSkipValueToOptString(value) {
+    return value === 0 ? FRAME_SKIP.FS_OFF : String(value);
+  }
+
+  // WRC (2026-09-08): called synchronously FROM the core (retro_run() in
+  // libretro.cpp, via EM_ASM_INT) the frame after wrc_set_options(OPT1)
+  // flips its pending-change flag - see that file's wrc_on_set_options()/
+  // retro_run() for the C++ side. Must return a plain int (0=off matching
+  // reicast_frame_skipping's "disabled"), not the prefs string value.
+  // Real iOS testing (Crazy Taxi, heavy 3D scenes) showed frame skipping
+  // trades an unnoticeable amount of visual smoothness for a real fix to
+  // choppy/missing audio chunks (frees up main-thread time the
+  // single-threaded core needs to keep audio production on schedule - see
+  // PTHREAD=0's own history in Makefile.emscripten.flycast for why this
+  // core can't just move audio to its own thread instead).
+  getPendingFrameSkip() {
+    return this.resolveFrameSkip();
+  }
+
+  // WRC (2026-09-09): checking "is FPS good while frame-skip 1 is already
+  // active" can't tell us the underlying scene got lighter - skip=1 is
+  // what's making it look good. The only way to actually find out is to
+  // periodically try dropping back to 0 and see what happens - a real
+  // probe, not a confirmation. goodStreakNeeded of 4 (~20s of sustained
+  // good FPS, checkFrequency = frequency * 5 in loop.js) is how long we
+  // wait before each probe attempt.
+  //
+  // If a probe fails IMMEDIATELY (bounces back to 1 on its very first
+  // check) too many times, giveUpThreshold stops trying for the rest of
+  // the session - converges to sticky-1 for a game that's genuinely,
+  // reliably too demanding at skip=0 instead of repeat-probing (each
+  // failed probe risks a brief real glitch) forever with zero chance of
+  // success. 25 (~8-10 min of exploration at ~20s/cycle) instead of no
+  // limit at all.
+  //
+  // WRC (2026-09-09), real-world correction: a game that's mostly fine at
+  // 0 with only occasional/rare dips (confirmed live: Sonic Adventure) was
+  // wrongly getting sticky-1'd too - every dip while at skip=0 counted
+  // against revertCount the same whether it was an immediate probe
+  // failure or just ambient bad luck after a long successful run at 0.
+  // zeroSurvivedOneWindow tracks whether the CURRENT stint at skip=0 has
+  // already lived through at least one good check - if so, a later dip is
+  // evidence the scene got briefly heavier, not that skip=0 was the wrong
+  // steady-state choice, so it reverts to 1 for that window (still avoids
+  // the audible glitch) without spending give-up budget on it.
+  goodStreakNeeded = 4;
+  goodStreak = 0;
+  giveUpThreshold = 25;
+  revertCount = 0;
+  autoGaveUp = false;
+  zeroSurvivedOneWindow = false;
+
+  // WRC (2026-09-09): NTSC by default (Dreamcast's more common case);
+  // switched to 48 (matching the same ~2fps margin as 60/58) on real PAL
+  // detection via setPalMode() below. Not derived from a hardcoded 60 -
+  // this IS the actual per-game threshold now.
+  frameSkipFpsThreshold = 58;
+
+  // WRC (2026-09-09): called from the core (libretro.cpp, via EM_ASM) the
+  // moment SPG_CONTROL.isPAL() - the same hardware-register-backed
+  // detection setAVInfo() itself uses - actually changes, in either
+  // direction. A native 50Hz PAL game would otherwise always read as
+  // "too slow" against a hardcoded NTSC threshold. Resets all the auto
+  // state (streak/revert/give-up) if auto is currently enabled, since
+  // everything accumulated so far was measured against the wrong
+  // threshold and no longer means anything.
+  setPalMode(isPal) {
+
+// TODO: Investigate this more
+isPal = false;
+
+    this.frameSkipFpsThreshold = isPal ? 48 : 58;
+    this.frequency = isPal ? 50 : 60;
+
+    if (this.getPrefs().getFrameSkip() === FRAME_SKIP.FS_AUTO) {
+      this.goodStreak = 0;
+      this.revertCount = 0;
+      this.autoGaveUp = false;
+      this.zeroSurvivedOneWindow = false;
+      LOG.info(`[auto frame skip] region changed (PAL=${isPal}), threshold now ${this.frameSkipFpsThreshold}, auto state reset`);
+    }
+  }
+
+  // WRC (2026-09-08): registered via createDisplayLoop() below on
+  // DisplayLoop's new (unconditional, non-debug-gated) setFpsCallback() -
+  // fires roughly every 5s (checkFrequency = frequency * 5 in loop.js),
+  // already a windowed average, not an instantaneous per-frame reading.
+  // Only acts when the persisted preference is actually "auto" - a
+  // manually-chosen Off/1/2 is left alone.
+  onFpsUpdate(fps) {
+    if (this.getPrefs().getFrameSkip() !== FRAME_SKIP.FS_AUTO || this.autoGaveUp) return;
+
+    const isLow = fps < this.frameSkipFpsThreshold;
+    let newLevel = this.currentFrameSkip;
+
+    if (isLow) {
+      this.goodStreak = 0;
+      if (this.currentFrameSkip === 0) {
+        if (!this.zeroSurvivedOneWindow) {
+          // Failed on the very first check after ascending - a genuine
+          // probe failure, not just ambient variance in an otherwise-fine
+          // scene. This is the only case that spends give-up budget.
+          this.revertCount++;
+          if (this.revertCount > this.giveUpThreshold) {
+            this.autoGaveUp = true;
+            LOG.info('[auto frame skip] repeated immediate bounce-backs, giving up and staying at 1 for the rest of this session');
+          }
+        }
+      }
+      newLevel = 1;
+    } else if (this.currentFrameSkip === 1) {
+      this.goodStreak++;
+      if (this.goodStreak >= this.goodStreakNeeded) {
+        this.goodStreak = 0;
+        newLevel = 0;
+        this.zeroSurvivedOneWindow = false;
+      }
+    } else if (this.currentFrameSkip === 0) {
+      // Good window at skip=0 - this stint has now proven itself at least
+      // once, so a later dip is ambient, not a failed probe.
+      this.zeroSurvivedOneWindow = true;
+    }
+
+    if (newLevel !== this.currentFrameSkip) {
+      this.currentFrameSkip = newLevel;
+      this.applyGameSettings();
+    }
   }
 
   getScriptUrl() {
@@ -190,6 +475,21 @@ export class Emulator extends RetroAppWrapper {
 
   getPrefs() {
     return this.prefs;
+  }
+
+  // WRC (2026-09-08): bigger ring buffer than PPSSPP's 8192+4096/2048
+  // (double, on both the main ring buffer and the script-processor chunk
+  // size) - deliberately trading a bit more latency for a bigger cushion
+  // against the main-thread stalls a heavy 3D Dreamcast scene can cause,
+  // which is exactly what was starving the previous AudioWorklet sink's
+  // much thinner (~46ms) buffer on iOS.
+  createAudioProcessor() {
+    return new ScriptAudioProcessor(
+      2,
+      44100,
+      16384 + 8192,
+      4096
+    ).setDebug(this.debug);
   }
 
   createControllers() {
@@ -237,8 +537,11 @@ export class Emulator extends RetroAppWrapper {
       FS.mkdir('/home/web_user/retroarch/userdata/system/dc');
     } catch (e) {}
 
+    const frameSkip = this.frameSkipValueToOptString(this.resolveFrameSkip());
     const opt =
-      'reicast_hle_bios = "disabled"\n'/* +
+      'reicast_hle_bios = "disabled"\n' +
+      'reicast_enable_dsp = "disabled"\n' +
+      `reicast_frame_skipping = "${frameSkip}"\n` /*+
       'reicast_threaded_rendering = "disabled"\n' +
       'reicast_internal_resolution = "640x480"\n' +
       'reicast_mipmapping = "disabled"\n' +
@@ -278,6 +581,7 @@ export class Emulator extends RetroAppWrapper {
     // let diagCount = 0;
     // let lastMemMB = 0;
     // const poller = setInterval(() => {
+    //     const { Module } = window;
     //     if (!Module) { diagCount++; return; }
     //     const M = Module;
     //     const prof = M._prof || {};
@@ -314,9 +618,9 @@ export class Emulator extends RetroAppWrapper {
     );
   }
 
-  isEscapeHackEnabled() {
-    return false;
-  }
+  // isEscapeHackEnabled() {
+  //   return false;
+  // }
 
   // WRC POC (cache-dump sizing, 2026-09-01): on an actual pause transition,
   // log the current compiled-cache size via the paired POC export in
@@ -342,7 +646,24 @@ export class Emulator extends RetroAppWrapper {
     return result;
   }
 
-  applyGameSettings() {}
+  // WRC (2026-09-08): live-apply bridge, same mechanism
+  // webrcade-app-beetle-psx uses for disk eject/analog mode/etc - the base
+  // class already calls this once during boot (RetroAppWrapper's onStart()
+  // sequence), and it's safe to call again any time after (e.g. from the
+  // pause-menu settings screen) to re-apply live without a restart. See the
+  // matching wrc_on_set_options() in retrostash/flycast-wasm's
+  // source-canonical/shell/libretro/libretro.cpp for the core-side half -
+  // bits 0-1 (OPT1|OPT2) carry the current frame-skip level.
+  applyGameSettings() {
+    const { Module } = window;
+    if (!Module || typeof Module._wrc_set_options !== 'function') return;
+
+    // OPT1 just flips a pending-change flag on the core side - it calls
+    // straight back into getPendingFrameSkip() above (via EM_ASM_INT) on
+    // the next retro_run() to fetch the actual current value, rather than
+    // encoding it into these bits directly.
+    Module._wrc_set_options(this.OPT1);
+  }
 
   isForceAspectRatio() {
     return false;
@@ -374,7 +695,37 @@ export class Emulator extends RetroAppWrapper {
       true
     );
     loop.setAdjustTimestampEnabled(true);
+    loop.setFpsCallback((fps) => this.onFpsUpdate(fps));
+    loop.setDebugCallback((fpsStr) => `${fpsStr}, ${this.getFrameSkipDebugInfo()}`);
     return loop;
+  }
+
+  // WRC (2026-09-09): same pattern as retro-snes9x/retro-genplusgx - called
+  // every frame by RetroAppWrapper; only returns a value (which DisplayLoop
+  // applies live, no restart) when setPalMode() has actually changed the
+  // target frequency since the last check.
+  // getDisplayLoopReturn() {
+  //   if (this.lastFrequency !== this.frequency) {
+  //     this.lastFrequency = this.frequency;
+  //     return this.frequency;
+  //   }
+  //   return undefined;
+  // }
+
+  // WRC (2026-09-09): visibility into the auto frame-skip state machine
+  // (see onFpsUpdate() above) for the debug overlay - streak progress
+  // toward the next probe, revert count toward giving up, and whether it's
+  // already given up, so it's actually observable during real testing
+  // instead of inferring it from behavior.
+  getFrameSkipDebugInfo() {
+    const persisted = this.getPrefs().getFrameSkip();
+    if (persisted !== FRAME_SKIP.FS_AUTO) {
+      return `FS: ${this.currentFrameSkip} (manual)`;
+    }
+    if (this.autoGaveUp) {
+      return `FS: ${this.currentFrameSkip} (auto, thresh ${this.frameSkipFpsThreshold}, gave up)`;
+    }
+    return `FS: ${this.currentFrameSkip} (auto, thresh ${this.frameSkipFpsThreshold}, streak ${this.goodStreak}/${this.goodStreakNeeded}, reverts ${this.revertCount}/${this.giveUpThreshold})`;
   }
 
   getShotAspectRatio() { return this.getDefaultAspectRatio(); }
@@ -663,6 +1014,13 @@ export class Emulator extends RetroAppWrapper {
         }
 
         LOG.info(`Restored Dreamcast save data: ${saveFiles.length} file(s)`);
+        // WRC DIAGNOSTIC (2026-09-09): chasing a "LOAD failed" VMU report -
+        // logging exact byte sizes on restore to compare against what was
+        // actually saved (saveState() below already logs per-file sizes on
+        // the save side). A real VMU image must be exactly 131072 bytes -
+        // if what's restored here doesn't match that, the stored save data
+        // itself is truncated/corrupted, not a timing/code issue.
+        saveFiles.forEach(f => LOG.info(`  ${f.name}: ${f.content.length} bytes`));
 
         await this.getSaveManager().checkFilesChanged(saveFiles);
       }
@@ -705,6 +1063,20 @@ export class Emulator extends RetroAppWrapper {
       this.jitCachePrimeFrameCount++;
     }
     */
+
+    // WRC (2026-09-08): same delayed-start pattern as
+    // webrcade-app-retro-ppsspp/snes9x - wait a couple frames after
+    // onFrame() starts firing (real SH4 execution has already begun by
+    // then, see RetroAppWrapper's main loop) before starting the
+    // ScriptAudioProcessor, then only once.
+    if (this.audioStarted !== -1) {
+      if (this.audioStarted > 1) {
+        this.audioStarted = -1;
+        this.audioProcessor.start();
+      } else {
+        this.audioStarted++;
+      }
+    }
   }
 
   pollControls() {
@@ -712,8 +1084,19 @@ export class Emulator extends RetroAppWrapper {
 
     controllers.poll();
 
+    // WRC (2026-09-11): matches RetroAppWrapper.pollControls()'s current
+    // shared version (webrcade-app-common/src/app/retrowrapper/index.js)
+    // - flycast has its own pollControls() (Dreamcast's JOYPAD_* bitmask
+    // is a different scheme than the base class's generic INP_*), so it
+    // doesn't inherit this for free and had drifted out of sync: missing
+    // RTRIG here (added when only LTRIG's real-hardware-analog-trigger
+    // status was considered; RTRIG has the identical property and the
+    // same accidental-combo risk once it's carrying real analog pressure
+    // for braking), and START/SELECT weren't suppressed during the
+    // escape-hack window like the shared version does.
     if (
       controllers.isControlDown(0, CIDS.LTRIG) ||
+      controllers.isControlDown(0, CIDS.RTRIG) ||
       controllers.isControlDown(0, CIDS.LANALOG) ||
       controllers.isControlDown(0, CIDS.RANALOG)
     ) {
@@ -725,10 +1108,12 @@ export class Emulator extends RetroAppWrapper {
     for (let i = 0; i < 4; i++) {
       let input = 0;
 
-      if (
-        controllers.isControlDown(0 /*i*/, CIDS.ESCAPE) &&
-        (this.escapeCount === -1 || this.escapeCount < 60)
-      ) {
+      const escapeOk =
+        !this.isEscapeHackEnabled() ||
+        this.escapeCount === -1 ||
+        this.escapeCount < 60;
+
+      if (controllers.isControlDown(0 /*i*/, CIDS.ESCAPE) && escapeOk) {
         if (this.pause(true)) {
           controllers
             .waitUntilControlReleased(0 /*i*/, CIDS.ESCAPE)
@@ -750,6 +1135,13 @@ export class Emulator extends RetroAppWrapper {
       if (controllers.isControlDown(i, CIDS.RBUMP)) input |= JOYPAD_R2;
       // if (controllers.isControlDown(i, CIDS.LTRIG)) input |= JOYPAD_L2;
       // if (controllers.isControlDown(i, CIDS.RTRIG)) input |= JOYPAD_R2;
+      // WRC (2026-09-11): no escapeOk gate here (unlike the shared
+      // RetroAppWrapper.pollControls() version) - that gate exists there
+      // to suppress START/SELECT during the RTRIG+RANALOG alternate
+      // escape combo window, but Dreamcast has no SELECT button and
+      // flycast doesn't wire up the right analog stick click at all, so
+      // that alternate combo path never applies here. Only the ESCAPE
+      // check itself needs escapeOk.
       if (controllers.isControlDown(i, CIDS.SELECT)) input |= JOYPAD_SELECT;
 
       let axisX = controllers.getAxisValue(i, 0, true);
@@ -770,7 +1162,25 @@ export class Emulator extends RetroAppWrapper {
         if (keyToControlMapping.isControlDown(ANALOG_DOWN)) axisY = 1;
       }
 
-      this.sendInput(i, input, axisX, axisY, 0, 0);
+      // WRC (2026-09-11): real Dreamcast L/R triggers are analog (0-255 on
+      // the actual hardware), not just digital buttons - sendInput()'s
+      // last two args (analog1x/analog1y) would normally carry a second
+      // analog stick, which the Dreamcast controller doesn't have, so
+      // they're repurposed here to carry L/R trigger PRESSURE instead
+      // (getButtonValue() reads the gamepad's raw button .value, 0.0-1.0,
+      // distinct from isControlDown()'s digital pressed/released above).
+      // No new plumbing needed - the C++ side (libretro.cpp's
+      // wrc_libretro_input_state()) already receives these same two
+      // values via wrc_input_state_analog[port][2]/[3]; it just needs to
+      // interpret them as trigger pressure for RETRO_DEVICE_INDEX_ANALOG_
+      // BUTTON queries instead of a nonexistent right stick. Digital
+      // LBUMP/RBUMP above still work standalone (keyboard, or a pad
+      // without analog trigger support) - the C++ side gives them
+      // priority (full value) over these when pressed.
+      const ltrig = controllers.getButtonValue(i, CIDS.LTRIG);
+      const rtrig = controllers.getButtonValue(i, CIDS.RTRIG);
+
+      this.sendInput(i, input, axisX, axisY, ltrig, rtrig);
     }
   }
 }
