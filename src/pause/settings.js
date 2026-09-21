@@ -54,6 +54,8 @@ export class FlycastSettingsEditor extends Component {
       screenSize: emulator.getPrefs().getScreenSize(),
       origFrameSkip: emulator.getPrefs().getFrameSkip(),
       frameSkip: emulator.getPrefs().getFrameSkip(),
+      origScreenControls: emulator.getPrefs().getScreenControls(),
+      screenControls: emulator.getPrefs().getScreenControls(),
     }
 
     this.shaderService = this.props.emulator.getShadersService();
@@ -65,7 +67,7 @@ export class FlycastSettingsEditor extends Component {
   }
 
   render() {
-    const { emulator, onClose } = this.props;
+    const { emulator, onClose, showOnScreenControls } = this.props;
     const { tabIndex, values, focusGridComps } = this.state;
 
     const setFocusGridComps = (comps) => {
@@ -101,6 +103,11 @@ export class FlycastSettingsEditor extends Component {
             emulator.getPrefs().setFrameSkip(values.frameSkip);
             updated = true;
             frameSkipChanged = true;
+          }
+          if (values.origScreenControls !== values.screenControls) {
+            emulator.getPrefs().setScreenControls(values.screenControls);
+            emulator.updateOnScreenControls();
+            updated = true;
           }
           if (updated) {
             emulator.getPrefs().save();
@@ -139,6 +146,7 @@ export class FlycastSettingsEditor extends Component {
                 emulator={emulator}
                 isBilinearMode={true}
                 isActive={tabIndex === 1}
+                showOnScreenControls={showOnScreenControls}
                 setFocusGridComps={setFocusGridComps}
                 values={values}
                 setValues={setValues}

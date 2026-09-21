@@ -1,5 +1,5 @@
 import {
-  RetroAppWrapper,
+  BasicRetroAppWrapper,
   DisplayLoop,
   LOG,
   Controller,
@@ -54,6 +54,14 @@ const ANALOG_DOWN = ANALOG_BIT | CIDS.DOWN;
 const ANALOG_LEFT = ANALOG_BIT | CIDS.LEFT;
 const ANALOG_RIGHT = ANALOG_BIT | CIDS.RIGHT;
 
+// WRC - same fine-positioning modifier scheme as the N64 apps
+// (webrcade-app-parallel-n64's index.js): Control reduces the analog
+// stick to 50% deflection, Shift to 75% (both held stacks to 25%). Unlike
+// PSP, Dreamcast has no real Select button for either Shift key to
+// collide with, so both tiers are available here.
+const ANALOG_50 = 0x2000;
+const ANALOG_25 = 0x1000;
+
 class DreamcastKeyCodeToControlMapping extends KeyCodeToControlMapping {
   constructor() {
     super({
@@ -73,7 +81,20 @@ class DreamcastKeyCodeToControlMapping extends KeyCodeToControlMapping {
       [KCODES.S]: CIDS.Y,
       [KCODES.Q]: CIDS.LBUMP,
       [KCODES.W]: CIDS.RBUMP,
+      [KCODES.CONTROL_RIGHT]: ANALOG_50,
+      [KCODES.CONTROL_LEFT]: ANALOG_50,
+      [KCODES.SHIFT_RIGHT]: ANALOG_25,
+      [KCODES.SHIFT_LEFT]: ANALOG_25,
     });
+  }
+
+  // This app maps both Control keys to Analog 50% and both Shift keys to
+  // Analog 25% above -- real gameplay modifiers. The shared Ctrl+Shift
+  // pause sequence collides with holding both together, so it's disabled
+  // for this app only. The literal Escape key (still mapped above) and
+  // the gamepad pause combo (SL+X, LT+LA) are unaffected.
+  isEscapeKeySequenceEnabled() {
+    return false;
   }
 }
 
@@ -197,7 +218,7 @@ class DreamcastKeyCodeToControlMapping extends KeyCodeToControlMapping {
 //   );
 // })();
 
-export class Emulator extends RetroAppWrapper {
+export class Emulator extends BasicRetroAppWrapper {
 
   // WRC - required by RetroAppWrapper itself (retrowrapper/index.js:914,
   // `this.saveStatePath = ${this.saveStatePrefix}${this.SAVE_NAME}`) to
@@ -622,6 +643,12 @@ isPal = false;
   //   return false;
   // }
 
+  // Base class default pauses on any tap anywhere on screen -- redundant
+  // (and disruptive) now that there's a dedicated Pause button in the
+  // touch overlay. Same override every other TouchOverlay app uses for the
+  // same reason.
+  createTouchListener() {}
+
   // WRC POC (cache-dump sizing, 2026-09-01): on an actual pause transition,
   // log the current compiled-cache size via the paired POC export in
   // core/rec-wasm/rec_wasm.cpp (WRC_CACHE_DUMP_POC / wasm_cache_dump_bytes).
@@ -665,8 +692,15 @@ isPal = false;
     Module._wrc_set_options(this.OPT1);
   }
 
+  // WRC (2026-09-13): true, not false - this app already has
+  // getUseNewResizeStyle() returning true (its native build is on the
+  // lighter-weight resize path, not the legacy video_driver_reinit() one
+  // that's crash-prone in the WASM/WebGL build - see that getter's own
+  // comment in retrowrapper/index.js), so there's no crash risk here.
+  // Confirmed visually on retro-mupen64plus-next that leaving this false
+  // causes real horizontal stretching distortion.
   isForceAspectRatio() {
-    return false;
+    return true;
   }
 
   getUseNewResizeStyle() {
@@ -1077,6 +1111,10 @@ isPal = false;
         this.audioStarted++;
       }
     }
+
+    // Touch/mouse/keyboard interaction detection + on-screen touch overlay
+    // gating is inherited from BasicRetroAppWrapper.
+    super.onFrame();
   }
 
   pollControls() {
@@ -1084,21 +1122,22 @@ isPal = false;
 
     controllers.poll();
 
-    // WRC (2026-09-11): matches RetroAppWrapper.pollControls()'s current
-    // shared version (webrcade-app-common/src/app/retrowrapper/index.js)
-    // - flycast has its own pollControls() (Dreamcast's JOYPAD_* bitmask
-    // is a different scheme than the base class's generic INP_*), so it
-    // doesn't inherit this for free and had drifted out of sync: missing
-    // RTRIG here (added when only LTRIG's real-hardware-analog-trigger
-    // status was considered; RTRIG has the identical property and the
-    // same accidental-combo risk once it's carrying real analog pressure
-    // for braking), and START/SELECT weren't suppressed during the
-    // escape-hack window like the shared version does.
+    // WRC (2026-09-12): only LTRIG/LANALOG are watched here - matches
+    // BasicRetroAppWrapper's own pollControls() scoping
+    // (webrcade-app-common/src/app/retrowrapper/index.js), flycast just
+    // has its own copy since Dreamcast's JOYPAD_* bitmask is a different
+    // scheme than the base class's generic INP_*. RTRIG/RANALOG used to
+    // be watched too (superseded 2026-09-11 note removed), but neither
+    // Start nor Select is ever gated by escapeOk in this app (see below -
+    // Dreamcast has no Select button, and flycast doesn't wire up the
+    // right analog stick click at all), so nothing downstream ever
+    // consults their hold-time. Watching them anyway would just risk the
+    // same bug the shared version had: a real, extended RTRIG hold
+    // (analog braking) could make the unrelated LT+LA Pause combo
+    // temporarily inaccessible while held.
     if (
       controllers.isControlDown(0, CIDS.LTRIG) ||
-      controllers.isControlDown(0, CIDS.RTRIG) ||
-      controllers.isControlDown(0, CIDS.LANALOG) ||
-      controllers.isControlDown(0, CIDS.RANALOG)
+      controllers.isControlDown(0, CIDS.LANALOG)
     ) {
       this.escapeCount = this.escapeCount === -1 ? 0 : this.escapeCount + 1;
     } else {
@@ -1135,13 +1174,14 @@ isPal = false;
       if (controllers.isControlDown(i, CIDS.RBUMP)) input |= JOYPAD_R2;
       // if (controllers.isControlDown(i, CIDS.LTRIG)) input |= JOYPAD_L2;
       // if (controllers.isControlDown(i, CIDS.RTRIG)) input |= JOYPAD_R2;
-      // WRC (2026-09-11): no escapeOk gate here (unlike the shared
-      // RetroAppWrapper.pollControls() version) - that gate exists there
-      // to suppress START/SELECT during the RTRIG+RANALOG alternate
-      // escape combo window, but Dreamcast has no SELECT button and
-      // flycast doesn't wire up the right analog stick click at all, so
-      // that alternate combo path never applies here. Only the ESCAPE
-      // check itself needs escapeOk.
+      // WRC (2026-09-12): no escapeOk-style gate on Start/Select here,
+      // matching BasicRetroAppWrapper's own default (isStartEscapeHackEnabled()/
+      // isSelectEscapeHackEnabled(), both false unless an app opts in -
+      // see webrcade-app-beetle-psx for the one app that does). Dreamcast
+      // has no real Select button anyway, and flycast doesn't wire up the
+      // right analog stick click at all, so there's no real collision
+      // risk to opt into guarding against here. Only the ESCAPE check
+      // itself needs escapeOk.
       if (controllers.isControlDown(i, CIDS.SELECT)) input |= JOYPAD_SELECT;
 
       let axisX = controllers.getAxisValue(i, 0, true);
@@ -1156,10 +1196,18 @@ isPal = false;
       // not controllers.isControlDown()) and override the axis value by
       // hand. Player 1 (keyboard) only, matching the N64 apps.
       if (i === 0) {
-        if (keyToControlMapping.isControlDown(ANALOG_RIGHT)) axisX = 1;
-        if (keyToControlMapping.isControlDown(ANALOG_LEFT)) axisX = -1;
-        if (keyToControlMapping.isControlDown(ANALOG_UP)) axisY = -1;
-        if (keyToControlMapping.isControlDown(ANALOG_DOWN)) axisY = 1;
+        // WRC - fine-positioning modifiers (see ANALOG_50/ANALOG_25's
+        // definitions above): each held key reduces the full-deflection
+        // multiplier below, same stacking math as the N64 apps'
+        // pollControls().
+        let multiplier = 1;
+        if (keyToControlMapping.isControlDown(ANALOG_50)) multiplier -= 0.50;
+        if (keyToControlMapping.isControlDown(ANALOG_25)) multiplier -= 0.25;
+
+        if (keyToControlMapping.isControlDown(ANALOG_RIGHT)) axisX = multiplier;
+        if (keyToControlMapping.isControlDown(ANALOG_LEFT)) axisX = -multiplier;
+        if (keyToControlMapping.isControlDown(ANALOG_UP)) axisY = -multiplier;
+        if (keyToControlMapping.isControlDown(ANALOG_DOWN)) axisY = multiplier;
       }
 
       // WRC (2026-09-11): real Dreamcast L/R triggers are analog (0-255 on

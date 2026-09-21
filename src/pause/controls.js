@@ -41,6 +41,8 @@ export class KeyboardControlsTab extends ControlsTab {
         {this.renderKey('KeyS', 'Y')}
         {this.renderKey('KeyQ', 'L bumper')}
         {this.renderKey('KeyW', 'R bumper')}
+        {this.renderKey('ControlLeft', 'Analog -50%')}
+        {this.renderKey('ShiftLeft', 'Analog -25%')}
       </>
     );
   }
