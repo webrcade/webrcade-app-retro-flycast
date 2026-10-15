@@ -13,8 +13,8 @@ export class GamepadControlsTab extends ControlsTab {
         {this.renderControl('b', 'B')}
         {this.renderControl('x', 'X')}
         {this.renderControl('y', 'Y')}
-        {this.renderControl('lbump', 'L bumper')}
-        {this.renderControl('rbump', 'R bumper')}
+        {this.renderControl('lbump', 'L trigger (100%)')}
+        {this.renderControl('rbump', 'R trigger (100%)')}
         {this.renderControl('ltrig', 'L trigger (analog)')}
         {this.renderControl('rtrig', 'R trigger (analog)')}
       </>
@@ -39,8 +39,8 @@ export class KeyboardControlsTab extends ControlsTab {
         {this.renderKey('KeyX', 'B')}
         {this.renderKey('KeyA', 'X')}
         {this.renderKey('KeyS', 'Y')}
-        {this.renderKey('KeyQ', 'L bumper')}
-        {this.renderKey('KeyW', 'R bumper')}
+        {this.renderKey('KeyQ', 'L trigger (100%)')}
+        {this.renderKey('KeyW', 'R trigger (100%)')}
         {this.renderKey('ControlLeft', 'Analog -50%')}
         {this.renderKey('ShiftLeft', 'Analog -25%')}
       </>
